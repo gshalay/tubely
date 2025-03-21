@@ -1,15 +1,19 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"mime"
 	"net/http"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -18,7 +22,15 @@ import (
 )
 
 const (
-	MEDIA_MP4 = "video/mp4"
+	LANDSCAPE_RATIO    = "16:9"
+	PORTRAIT_RATIO     = "9:16"
+	MEDIA_MP4          = "video/mp4"
+	LANDSCAPE_PREFIX   = "/landscape/"
+	PORTRAIT_PREFIX    = "/portrait/"
+	OTHER_PREFIX       = "/other/"
+	NINE_SIXTEEN_RATIO = 0.5625
+	SIXTEEN_NINE_RATIO = 1.78
+	RATIO_TOLERANCE    = 0.10
 )
 
 func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request) {
@@ -104,9 +116,39 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 	io.Copy(vidTempFile, file)
 	vidTempFile.Seek(0, io.SeekStart)
 
+	fullPath, err := filepath.Abs(vidTempFile.Name())
+	if err != nil {
+		log.Printf("Couldn't get video file path")
+		respondWithError(w, http.StatusBadRequest, "Unable to get video path", err)
+		return
+	}
+
+	aspectRatio, err := getVideoAspectRatio(fullPath)
+	if err != nil {
+		log.Printf("Couldn't get video aspect ratio: %v", err)
+		respondWithError(w, http.StatusBadRequest, "Unable to get video aspect ratio", err)
+		return
+	}
+
+	vidFilename, err = processVideoForFastStart(fullPath)
+	if err != nil {
+		log.Printf("Couldn't set video for fast processing: %v", err)
+		respondWithError(w, http.StatusBadRequest, "Unable to encode video for fast processing: ", err)
+		return
+	}
+
+	objKey := ""
+	if aspectRatio == LANDSCAPE_RATIO {
+		objKey = LANDSCAPE_PREFIX + vidFilename
+	} else if aspectRatio == PORTRAIT_RATIO {
+		objKey = PORTRAIT_PREFIX + vidFilename
+	} else {
+		objKey = OTHER_PREFIX + vidFilename
+	}
+
 	_, err = cfg.s3Client.PutObject(context.TODO(), &s3.PutObjectInput{
 		Bucket:      &cfg.s3Bucket,
-		Key:         &vidFilename,
+		Key:         &objKey,
 		Body:        vidTempFile,
 		ContentType: &mediaType,
 	})
@@ -117,7 +159,7 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	vidUrl := fmt.Sprintf("https://%s.s3.%s.amazonaws.com/%s", cfg.s3Bucket, cfg.s3Region, vidFilename)
+	vidUrl := fmt.Sprintf("https://%s.s3.%s.amazonaws.com/%s", cfg.s3Bucket, cfg.s3Region, objKey)
 	vid.VideoURL = &vidUrl
 
 	err = cfg.db.UpdateVideo(vid)
@@ -127,5 +169,69 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	w.Header().Set("Content-Type", "video/mp4")
 	respondWithJSON(w, http.StatusOK, vid)
+}
+
+func getVideoAspectRatio(filePath string) (string, error) {
+	type Stream struct {
+		Width  int `json:"width"`
+		Height int `json:"height"`
+	}
+
+	type FFProbeOutput struct {
+		Streams []Stream `json:"streams"`
+	}
+
+	cmd := exec.Command("ffprobe", "-v", "error", "-print_format", "json", "-show_streams", filePath)
+	buf := &bytes.Buffer{}
+	cmd.Stdout = buf
+	cmd.Run()
+
+	var probeOutput FFProbeOutput
+
+	err := json.Unmarshal(buf.Bytes(), &probeOutput)
+	if err != nil {
+		log.Printf("couldn't get video aspect ratio: %v", err)
+		return "", err
+	}
+
+	if len(probeOutput.Streams) > 0 {
+		ratio := float64(probeOutput.Streams[0].Width) / float64(probeOutput.Streams[0].Height)
+		aspectRatio := ""
+
+		if (NINE_SIXTEEN_RATIO-RATIO_TOLERANCE) <= ratio && ratio <= (NINE_SIXTEEN_RATIO+RATIO_TOLERANCE) {
+			aspectRatio = "9:16"
+		} else if (SIXTEEN_NINE_RATIO-RATIO_TOLERANCE) <= ratio && ratio <= (SIXTEEN_NINE_RATIO+RATIO_TOLERANCE) {
+			aspectRatio = "16:9"
+		} else {
+			aspectRatio = "other"
+		}
+
+		return aspectRatio, nil
+	} else {
+		return "", fmt.Errorf("length of probe stream output is 0")
+	}
+}
+
+func processVideoForFastStart(filepath string) (string, error) {
+	outPath := filepath + ".processing"
+
+	log.Printf("p - %s", outPath)
+	os.Exit(1)
+
+	cmd := exec.Command("ffmpeg", "-i", filepath, "-c", "copy", "-movflags", "faststart", "-f", "mp4", outPath)
+
+	// Capture standard output and error
+	var outBuf, errBuf bytes.Buffer
+	cmd.Stdout = &outBuf
+	cmd.Stderr = &errBuf
+
+	err := cmd.Run()
+	if err != nil {
+		log.Printf("ffmpeg processing failed: %v, stderr: %s, stdout: %s", err, errBuf.String(), outBuf.String())
+		return "", err
+	}
+
+	return outPath, nil
 }

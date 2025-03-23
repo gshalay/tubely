@@ -15,6 +15,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/bootdotdev/learn-file-storage-s3-golang-starter/internal/auth"
@@ -130,7 +131,7 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	vidFilename, err = processVideoForFastStart(fullPath)
+	vidFilename, err = processVideoForFastStart(fullPath, vidFilename)
 	if err != nil {
 		log.Printf("Couldn't set video for fast processing: %v", err)
 		respondWithError(w, http.StatusBadRequest, "Unable to encode video for fast processing: ", err)
@@ -146,10 +147,15 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		objKey = OTHER_PREFIX + vidFilename
 	}
 
+	fastFile, err := os.Open(vidFilename)
+	if err != nil {
+		log.Fatalf("failed to open file: %v", err)
+	}
+
 	_, err = cfg.s3Client.PutObject(context.TODO(), &s3.PutObjectInput{
 		Bucket:      &cfg.s3Bucket,
 		Key:         &objKey,
-		Body:        vidTempFile,
+		Body:        fastFile,
 		ContentType: &mediaType,
 	})
 
@@ -159,7 +165,9 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	vidUrl := fmt.Sprintf("https://%s.s3.%s.amazonaws.com/%s", cfg.s3Bucket, cfg.s3Region, objKey)
+	vidUrl := fmt.Sprintf("%s,%s", cfg.s3Bucket, objKey)
+	log.Printf("vurl - %s", vidUrl)
+
 	vid.VideoURL = &vidUrl
 
 	err = cfg.db.UpdateVideo(vid)
@@ -168,6 +176,9 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		respondWithError(w, http.StatusBadRequest, "Unable to update video file", err)
 		return
 	}
+
+	fastFile.Close()
+	os.Remove(fastFile.Name())
 
 	w.Header().Set("Content-Type", "video/mp4")
 	respondWithJSON(w, http.StatusOK, vid)
@@ -214,11 +225,10 @@ func getVideoAspectRatio(filePath string) (string, error) {
 	}
 }
 
-func processVideoForFastStart(filepath string) (string, error) {
-	outPath := filepath + ".processing"
+func processVideoForFastStart(filepath, outPath string) (string, error) {
+	outPath = outPath + ".processing"
 
 	log.Printf("p - %s", outPath)
-	os.Exit(1)
 
 	cmd := exec.Command("ffmpeg", "-i", filepath, "-c", "copy", "-movflags", "faststart", "-f", "mp4", outPath)
 
@@ -234,4 +244,20 @@ func processVideoForFastStart(filepath string) (string, error) {
 	}
 
 	return outPath, nil
+}
+
+func generatePresignedURL(s3Client *s3.Client, bucket, key string, expireTime time.Duration) (string, error) {
+	objectInput := &s3.GetObjectInput{
+		Bucket: &bucket,
+		Key:    &key,
+	}
+
+	presignClient := s3.NewPresignClient(s3Client)
+	presignedReq, err := presignClient.PresignGetObject(context.TODO(), objectInput, s3.WithPresignExpires(expireTime))
+	if err != nil {
+		log.Printf("Couldn't presign s3 object.")
+		return "", err
+	}
+
+	return presignedReq.URL, nil
 }

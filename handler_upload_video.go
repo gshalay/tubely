@@ -15,7 +15,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/bootdotdev/learn-file-storage-s3-golang-starter/internal/auth"
@@ -165,9 +164,7 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	vidUrl := fmt.Sprintf("%s,%s", cfg.s3Bucket, objKey)
-	log.Printf("vurl - %s", vidUrl)
-
+	vidUrl := fmt.Sprintf("%s/%s", cfg.s3CfDistribution, objKey)
 	vid.VideoURL = &vidUrl
 
 	err = cfg.db.UpdateVideo(vid)
@@ -226,11 +223,9 @@ func getVideoAspectRatio(filePath string) (string, error) {
 }
 
 func processVideoForFastStart(filepath, outPath string) (string, error) {
-	outPath = outPath + ".processing"
+	oPath := outPath + ".processing"
 
-	log.Printf("p - %s", outPath)
-
-	cmd := exec.Command("ffmpeg", "-i", filepath, "-c", "copy", "-movflags", "faststart", "-f", "mp4", outPath)
+	cmd := exec.Command("ffmpeg", "-i", filepath, "-c", "copy", "-movflags", "faststart", "-f", "mp4", oPath)
 
 	// Capture standard output and error
 	var outBuf, errBuf bytes.Buffer
@@ -243,21 +238,5 @@ func processVideoForFastStart(filepath, outPath string) (string, error) {
 		return "", err
 	}
 
-	return outPath, nil
-}
-
-func generatePresignedURL(s3Client *s3.Client, bucket, key string, expireTime time.Duration) (string, error) {
-	objectInput := &s3.GetObjectInput{
-		Bucket: &bucket,
-		Key:    &key,
-	}
-
-	presignClient := s3.NewPresignClient(s3Client)
-	presignedReq, err := presignClient.PresignGetObject(context.TODO(), objectInput, s3.WithPresignExpires(expireTime))
-	if err != nil {
-		log.Printf("Couldn't presign s3 object.")
-		return "", err
-	}
-
-	return presignedReq.URL, nil
+	return oPath, nil
 }
